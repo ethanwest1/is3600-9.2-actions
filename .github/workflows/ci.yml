@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-build-publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest pytest-cov build twine awscli
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Run pytest with coverage + JUnit
+        run: |
+          pytest --cov=. --cov-report=xml:coverage.xml --junitxml=pytest-report.xml
+
+      - name: Upload reports (artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            pytest-report.xml
+
+      # Build exactly once on 3.13
+      - name: Build wheel and sdist (3.13 only)
+        if: matrix.python-version == '3.13'
+        run: |
+          python -m build
+          ls -l dist/
+
+      - name: Configure AWS credentials (3.13 only)
+        if: matrix.python-version == '3.13'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload .whl to S3 (3.13 only)
+        if: matrix.python-version == '3.13'
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+        run: aws s3 cp dist/*.whl s3://$S3_BUCKET/
+
+      - name: Publish .whl to CodeArtifact (3.13 only)
+        if: matrix.python-version == '3.13'
+        env:
+          CODEARTIFACT_DOMAIN: ${{ vars.CODEARTIFACT_DOMAIN }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+          CODEARTIFACT_REPOSITORY: ${{ vars.CODEARTIFACT_REPOSITORY }}
+        run: |
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --query authorizationToken --output text)
+
+          REPO_URL=$(aws codeartifact get-repository-endpoint \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY" \
+            --format pypi --query repositoryEndpoint --output text)
+
+          python -m twine upload --repository-url "$REPO_URL" -u aws -p "$TOKEN" dist/*.whl
